@@ -1,0 +1,396 @@
+const socket = io();
+
+// DOM Elements
+const menuScreen = document.getElementById('menu-screen');
+const lobbyScreen = document.getElementById('lobby-screen');
+const gameScreen = document.getElementById('game-screen');
+const loginForm = document.getElementById('login-form');
+const playerList = document.getElementById('player-list');
+
+// State
+let myNickname = '';
+let gameMode = 'computer';
+let difficulty = 'medium';
+let sets = 3;
+
+// Audio Context (Shared)
+window.audioCtx = null;
+
+// Login Form Submit
+loginForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+
+    // Initialize Audio Context on user interaction
+    if (!window.audioCtx) {
+        window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (window.audioCtx.state === 'suspended') {
+        window.audioCtx.resume();
+    }
+
+    const formData = new FormData(loginForm);
+    myNickname = formData.get('nickname');
+    difficulty = formData.get('difficulty');
+    sets = parseInt(formData.get('sets'));
+    gameMode = formData.get('mode');
+
+    if (gameMode === 'online') {
+        socket.emit('login', { nickname: myNickname, difficulty: difficulty, sets: sets });
+        showScreen('lobby-screen');
+    } else {
+        // Computer Mode
+        startGameLocal();
+    }
+});
+
+// TTS for all inputs on focus
+document.querySelectorAll('input, select, button').forEach(input => {
+    input.addEventListener('focus', () => {
+        let text = '';
+
+        // For radio buttons, announce the label text
+        if (input.type === 'radio') {
+            const label = input.closest('label');
+            if (label) {
+                text = label.textContent.trim();
+            }
+        }
+        // For select fields, announce label + current value
+        else if (input.tagName === 'SELECT') {
+            const label = document.querySelector(`label[for="${input.id}"]`);
+            const labelText = label ? label.textContent.trim() : '';
+            const currentValue = input.options[input.selectedIndex].text;
+            text = `${labelText} ${currentValue}`;
+        }
+        // For text inputs, announce label + placeholder/value
+        else if (input.tagName === 'INPUT' && input.type === 'text') {
+            const label = document.querySelector(`label[for="${input.id}"]`);
+            const labelText = label ? label.textContent.trim() : '';
+            text = labelText + (input.value ? ` ${input.value}` : '');
+        }
+        // For buttons, use aria-label or text content
+        else {
+            text = input.getAttribute('aria-label') || input.textContent || input.value;
+        }
+
+        if (text) speak(text);
+    });
+
+    // For selects, speak when value changes
+    if (input.tagName === 'SELECT') {
+        input.addEventListener('change', () => {
+            const label = document.querySelector(`label[for="${input.id}"]`);
+            const labelText = label ? label.textContent.trim() : '';
+            const newValue = input.options[input.selectedIndex].text;
+            speak(`${labelText} ${newValue}`);
+        });
+    }
+});
+
+// Settings Change Listeners
+document.getElementById('difficulty').addEventListener('change', (e) => {
+    difficulty = e.target.value;
+    if (gameMode === 'online' && myNickname) {
+        socket.emit('update_settings', { difficulty: difficulty, sets: sets });
+    }
+});
+
+document.getElementById('sets').addEventListener('change', (e) => {
+    sets = parseInt(e.target.value);
+    if (gameMode === 'online' && myNickname) {
+        socket.emit('update_settings', { difficulty: difficulty, sets: sets });
+    }
+});
+
+document.getElementById('btn-test-audio').addEventListener('click', async () => {
+    if (!window.audioCtx) {
+        window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (window.audioCtx.state === 'suspended') {
+        await window.audioCtx.resume();
+    }
+
+    // Play a simple beep to test context
+    const osc = window.audioCtx.createOscillator();
+    const gain = window.audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(window.audioCtx.destination);
+    osc.start();
+    osc.stop(window.audioCtx.currentTime + 0.2);
+
+    // Also try to play a game sound if available
+    if (window.playSound) {
+        // We need to ensure buffers are loaded first. 
+        // Since initGame loads them, we might not have them yet.
+        // Let's just rely on the beep for now to test the context.
+        console.log("Audio Context Test Beep sent.");
+    }
+
+    speak("Ses testi bir iki üç.");
+});
+
+// Socket Events
+socket.on('player_list', (players) => {
+    renderPlayerList(players);
+});
+
+function renderPlayerList(players) {
+    playerList.innerHTML = '';
+    const availablePlayers = [];
+
+    players.forEach(p => {
+        if (p.id === socket.id) return; // Don't show self
+
+        const li = document.createElement('li');
+        // Translate difficulty for display
+        const diffMap = { 'easy': 'Kolay', 'medium': 'Orta', 'hard': 'Zor' };
+        const diffDisplay = diffMap[p.difficulty] || p.difficulty;
+
+        li.textContent = `${p.nickname} (${diffDisplay}, ${p.sets} Set) - ${p.status === 'playing' ? 'Oyunda' : 'Bekliyor'}`;
+
+        if (p.status === 'idle') {
+            li.style.cursor = 'pointer';
+            li.setAttribute('tabindex', '0');
+            li.setAttribute('role', 'button');
+            li.setAttribute('aria-label', `${p.nickname}, ${diffDisplay} zorluk, ${p.sets} set. Meydan okumak için Enter veya Space basın.`);
+
+            // Click handler
+            li.onclick = () => challengePlayer(p.id);
+
+            // Keyboard handler
+            li.addEventListener('keydown', (e) => {
+                if (e.code === 'Enter' || e.code === 'Space') {
+                    e.preventDefault();
+                    challengePlayer(p.id);
+                }
+            });
+
+            // TTS on focus
+            li.addEventListener('focus', () => {
+                speak(`${p.nickname}, ${diffDisplay} zorluk, ${p.sets} set. Meydan okumak için Enter veya Space basın.`);
+            });
+
+            availablePlayers.push(li);
+        } else {
+            li.style.color = '#888';
+            li.style.cursor = 'default';
+            li.setAttribute('tabindex', '-1');
+        }
+
+        playerList.appendChild(li);
+    });
+
+    if (playerList.children.length === 0) {
+        playerList.innerHTML = '<li>Şu an çevrimiçi başka oyuncu yok.</li>';
+    }
+
+    // Add arrow key navigation for the list
+    playerList.addEventListener('keydown', (e) => {
+        const focusedElement = document.activeElement;
+        if (!focusedElement || focusedElement.parentElement !== playerList) return;
+
+        const focusableItems = Array.from(playerList.querySelectorAll('li[tabindex="0"]'));
+        const currentIndex = focusableItems.indexOf(focusedElement);
+
+        if (e.code === 'ArrowDown') {
+            e.preventDefault();
+            const nextIndex = (currentIndex + 1) % focusableItems.length;
+            focusableItems[nextIndex]?.focus();
+        } else if (e.code === 'ArrowUp') {
+            e.preventDefault();
+            const prevIndex = (currentIndex - 1 + focusableItems.length) % focusableItems.length;
+            focusableItems[prevIndex]?.focus();
+        }
+    });
+}
+
+function challengePlayer(id) {
+    socket.emit('challenge', id);
+    speak("Oyun isteği gönderildi. Bekleniyor.");
+}
+
+socket.on('challenge_received', (data) => {
+    const diffMap = { 'easy': 'Kolay', 'medium': 'Orta', 'hard': 'Zor' };
+    const diffDisplay = diffMap[data.difficulty] || data.difficulty;
+    speak(`${data.nickname} sizi oyuna davet ediyor. ${diffDisplay} mod, ${data.sets} set. Kabul etmek için Enter, reddetmek için Escape.`);
+    showChallengeModal(data);
+});
+
+socket.on('challenge_declined', (data) => {
+    speak(`${data.nickname} isteğinizi reddetti.`);
+    alert(`${data.nickname} isteğinizi reddetti.`);
+});
+
+socket.on('game_start', (data) => {
+    speak(`Oyun başlıyor. Rakibiniz: ${data.opponent}.`);
+    startGameOnline(data);
+});
+
+socket.on('opponent_disconnected', (data) => {
+    if (data.gameFinished) {
+        speak(`${data.nickname} masadan ayrıldı.`);
+        alert(`${data.nickname} masadan ayrıldı.`);
+    } else {
+        speak(`${data.nickname} oyundan ayrıldı. Kazandınız.`);
+        alert(`${data.nickname} oyundan ayrıldı. Kazandınız.`);
+    }
+    location.reload();
+});
+
+socket.on('rematch_request', (data) => {
+    // Close game over modal if it exists
+    const gameOverModal = document.getElementById('game-over-modal');
+    if (gameOverModal) {
+        gameOverModal.remove();
+    }
+
+    const msg = `${data.nickname} sizinle bir maç daha yapmak istiyor. Kabul etmek için Enter, masadan ayrılmak için Escape basın.`;
+    speak(msg);
+    showRematchModal(data);
+});
+
+socket.on('rematch_accepted', () => {
+    speak("Rakibiniz kabul etti. Yeni oyun başlıyor.");
+    location.reload(); // Simple approach: reload to restart
+});
+
+socket.on('rematch_declined', (data) => {
+    speak(`${data.nickname} reddetti. Ana menüye dönülüyor.`);
+    alert(`${data.nickname} reddetti.`);
+    location.reload();
+});
+
+// Challenge Modal Logic
+let pendingChallenge = null;
+function showChallengeModal(data) {
+    pendingChallenge = data;
+    const diffMap = { 'easy': 'Kolay', 'medium': 'Orta', 'hard': 'Zor' };
+    const diffDisplay = diffMap[data.difficulty] || data.difficulty;
+
+    const modal = document.createElement('div');
+    modal.id = 'challenge-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);display:flex;justify-content:center;align-items:center;z-index:1000;';
+    modal.innerHTML = `
+        <div style="background:#333;padding:20px;border-radius:10px;text-align:center;">
+            <h2>Oyun İsteği</h2>
+            <p>${data.nickname} sizinle oynamak istiyor.</p>
+            <p>Ayarlar: ${diffDisplay}, ${data.sets} Set</p>
+            <p>Kabul (Enter) / Red (Esc)</p>
+            <button id="btn-accept">Kabul Et</button>
+            <button id="btn-decline">Reddet</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    document.getElementById('btn-accept').onclick = () => respondChallenge(true);
+    document.getElementById('btn-decline').onclick = () => respondChallenge(false);
+
+    document.getElementById('btn-accept').focus();
+}
+
+function respondChallenge(accepted) {
+    if (!pendingChallenge) return;
+    socket.emit('challenge_response', { accepted, from: pendingChallenge.from });
+    document.getElementById('challenge-modal').remove();
+    pendingChallenge = null;
+}
+
+// Rematch Modal Logic
+let pendingRematch = null;
+function showRematchModal(data) {
+    pendingRematch = data;
+
+    const modal = document.createElement('div');
+    modal.id = 'rematch-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);display:flex;justify-content:center;align-items:center;z-index:1000;';
+    modal.innerHTML = `
+        <div style="background:#333;padding:20px;border-radius:10px;text-align:center;">
+            <h2>Revanche İsteği</h2>
+            <p>${data.nickname} sizinle bir maç daha yapmak istiyor.</p>
+            <p>Kabul (Enter) / Red (Esc)</p>
+            <button id="btn-rematch-accept">Kabul Et (Enter)</button>
+            <button id="btn-rematch-decline">Reddet (Esc)</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    document.getElementById('btn-rematch-accept').onclick = () => respondRematch(true);
+    document.getElementById('btn-rematch-decline').onclick = () => respondRematch(false);
+
+    document.getElementById('btn-rematch-accept').focus();
+}
+
+function respondRematch(accepted) {
+    if (!pendingRematch) return;
+
+    socket.emit('rematch_response', {
+        accepted,
+        from: pendingRematch.from,
+        gameId: window.gameState ? window.gameState.gameId : null
+    });
+
+    document.getElementById('rematch-modal').remove();
+    pendingRematch = null;
+
+    if (!accepted) {
+        location.reload();
+    }
+}
+
+// Keyboard shortcuts for modals
+window.addEventListener('keydown', (e) => {
+    if (pendingChallenge) {
+        if (e.code === 'Enter') respondChallenge(true);
+        if (e.code === 'Escape') respondChallenge(false);
+    }
+    if (pendingRematch) {
+        if (e.code === 'Enter') respondRematch(true);
+        if (e.code === 'Escape') respondRematch(false);
+    }
+});
+
+function showScreen(screenId) {
+    menuScreen.classList.add('hidden');
+    lobbyScreen.classList.add('hidden');
+    gameScreen.classList.add('hidden');
+
+    document.getElementById(screenId).classList.remove('hidden');
+}
+
+function startGameLocal() {
+    showScreen('game-screen');
+    if (window.initGame) {
+        window.initGame('computer', difficulty, sets, null, myNickname, "Bilgisayar");
+    }
+}
+
+function startGameOnline(data) {
+    showScreen('game-screen');
+    if (window.initGame) {
+        // Use settings from the challenger (host) which are passed in data.settings
+        // If I am the host, I use my own settings. If I am client, I use host's settings.
+        // Wait, server passes settings in game_start.
+        // data.settings contains { difficulty, sets } from the challenger.
+
+        let gameDiff = difficulty;
+        let gameSets = sets;
+
+        if (data.settings) {
+            gameDiff = data.settings.difficulty;
+            gameSets = data.settings.sets;
+        }
+
+        window.initGame('online', gameDiff, gameSets, {
+            socket: socket,
+            gameId: data.gameId,
+            role: data.role
+        }, myNickname, data.opponent);
+    }
+}
+
+function speak(text) {
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = 'tr-TR';
+    window.speechSynthesis.speak(utter);
+}

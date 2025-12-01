@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="tr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pinpon V2 - Çevrimiçi ve Erişilebilir</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div id="app-container">
+        <!-- Login / Menu Screen -->
+        <section id="menu-screen" aria-labelledby="menu-heading">
+            <h1 id="menu-heading">Pinpon V2 Giriş</h1>
+
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="nickname">Takma Adınız:</label>
+                    <input type="text" id="nickname" name="nickname" required autocomplete="off">
+                </div>
+
+                <div class="form-group">
+                    <label for="difficulty">Zorluk Düzeyi:</label>
+                    <select id="difficulty" name="difficulty">
+                        <option value="easy">Kolay</option>
+                        <option value="medium" selected>Orta</option>
+                        <option value="hard">Zor</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="sets">Set Sayısı:</label>
+                    <select id="sets" name="sets">
+                        <option value="1">1 Set</option>
+                        <option value="3" selected>3 Set</option>
+                        <option value="5">5 Set</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <fieldset>
+                        <legend>Oyun Modu</legend>
+                        <label>
+                            <input type="radio" name="mode" value="computer" checked>
+                            Bilgisayara Karşı
+                        </label>
+                        <label>
+                            <input type="radio" name="mode" value="online">
+                            Çevrimiçi Oyuncu
+                        </label>
+                    </fieldset>
+                </div>
+
+                <button type="button" id="btn-test-audio" style="margin-top:10px;background:#555;">Ses Testi
+                    Yap</button>
+                <button type="submit" id="btn-start">Masaya Geç</button>
+            </form>
+        </section>
+
+        <!-- Lobby Screen (Online Only) -->
+        <section id="lobby-screen" class="hidden" aria-labelledby="lobby-heading">
+            <h2 id="lobby-heading">Bekleme Salonu</h2>
+            <p>Çevrimiçi oyuncular aşağıda listelenmektedir. Oynamak istediğiniz kişiye tıklayın.</p>
+            <ul id="player-list" aria-live="polite">
+                <!-- Players will be listed here -->
+            </ul>
+            <button id="btn-back-menu">Ana Menüye Dön</button>
+        </section>
+
+        <!-- Game Screen -->
+        <section id="game-screen" class="hidden" aria-label="Oyun Ekranı">
+            <div id="game-ui">
+                <div class="score-board">
+                    <span id="score-player">0</span> - <span id="score-opponent">0</span>
+                </div>
+                <div id="status-message" aria-live="assertive"></div>
+            </div>
+
+            <div id="table">
+                <div id="net"></div>
+                <div id="opponent-paddle" class="paddle"></div>
+                <div id="ball"></div>
+                <div id="player-paddle" class="paddle"></div>
+            </div>
+
+            <!-- Chat Overlay -->
+            <div id="chat-overlay" class="hidden">
+                <div id="chat-history" aria-live="polite"></div>
+                <input type="text" id="chat-input" placeholder="Mesaj yazın (Enter gönderir, Esc kapatır)">
+            </div>
+        </section>
+    </div>
+
+    <!-- Audio Elements for Preloading -->
+    <div id="audio-preload" style="display:none;"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="client.js?v=2"></script>
+    <script src="game.js?v=2"></script>
+</body>
+
+</html>

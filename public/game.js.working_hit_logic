@@ -1,0 +1,957 @@
+/* --- GAME LOGIC --- */
+
+// Assets URLs
+const ASSETS = {
+    paddle: 'assets/hit.wav',
+    wall: 'assets/bounce.wav',
+    ballLoop: 'assets/bounce.wav',
+    applause: 'assets/applause.wav',
+    OponentPoint: 'assets/OponentPoint.wav',
+    GameOverWin: 'assets/GameOverWin.wav',
+    GameOverLost: 'assets/GameOverLost.wav',
+    training: 'assets/Training.mp3'
+};
+
+let audioCtx;
+let masterGain;
+let buffers = {};
+
+// Audio Physics State
+let ballLoopOsc = null;
+let ballPanner = null;
+let ballFilter = null;
+let ballLoopGain = null;
+
+let alignmentOsc = null;
+let alignmentGain = null;
+
+// Game State
+let gameState = {
+    mode: 'computer',
+    difficulty: 'medium',
+    sets: 3,
+    scores: { player: 0, opponent: 0 },
+    ball: { x: 300, z: 0, vx: 0, vz: 0, speed: 5 },
+    player: { x: 300 },
+    opponent: { x: 300 },
+    active: false,
+    paused: false,
+    serving: false,
+    currentServer: 'player',
+    socket: null,
+    gameId: null,
+    role: null,
+    lastSentX: 0,
+    setsWon: { player: 0, opponent: 0 },
+    myName: 'Ben',
+    opponentName: 'Rakip'
+};
+
+const TABLE_W = 600;
+const PADDLE_W = 90;
+const DIFFICULTIES = {
+    easy: { speed: 1.0, accel: 0.05 },
+    medium: { speed: 3.0, accel: 0.3 },
+    hard: { speed: 5.0, accel: 0.6 }
+};
+
+async function loadSound(url) {
+    try {
+        console.log("Loading sound:", url);
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        const arrayBuffer = await response.arrayBuffer();
+        return await audioCtx.decodeAudioData(arrayBuffer);
+    } catch (e) {
+        console.error("Ses yüklenemedi:", url, e);
+        speak("Ses dosyası yüklenemedi: " + url);
+        return null;
+    }
+}
+
+async function initAudioSystem() {
+    console.log("Initializing Audio System...");
+    if (window.audioCtx) {
+        audioCtx = window.audioCtx;
+    } else {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        window.audioCtx = audioCtx;
+    }
+
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.8;
+    masterGain.connect(audioCtx.destination);
+
+    try {
+        buffers.paddle = await loadSound(ASSETS.paddle);
+        buffers.wall = await loadSound(ASSETS.wall);
+        buffers.ballLoop = await loadSound(ASSETS.ballLoop);
+        buffers.applause = await loadSound(ASSETS.applause);
+        buffers.OponentPoint = await loadSound(ASSETS.OponentPoint);
+        buffers.GameOverWin = await loadSound(ASSETS.GameOverWin);
+        buffers.GameOverLost = await loadSound(ASSETS.GameOverLost);
+        buffers.training = await loadSound(ASSETS.training);
+        console.log("All sounds loaded.");
+    } catch (e) {
+        console.error("Error loading sounds:", e);
+        speak("Sesler yüklenirken hata oluştu.");
+    }
+}
+
+function playSound(type, pan = 0, volume = 1.0, pitch = 1.0) {
+    if (!audioCtx || !buffers[type]) return 0;
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffers[type];
+    source.playbackRate.value = pitch;
+    source.loop = false;
+
+    const gainNode = audioCtx.createGain();
+    gainNode.gain.value = volume;
+
+    const panner = audioCtx.createStereoPanner();
+    panner.pan.value = pan;
+
+    source.connect(gainNode);
+    gainNode.connect(panner);
+    panner.connect(masterGain);
+
+    source.start();
+
+    return buffers[type] ? (buffers[type].duration * 1000) : 0;
+}
+
+function playStep(targetX = null) {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const bufferSize = audioCtx.sampleRate * 0.15;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+        data[i] = Math.random() * 2 - 1;
+    }
+
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = buffer;
+
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 600 + (Math.random() * 200);
+    filter.Q.value = 1.0;
+
+    const gain = audioCtx.createGain();
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
+
+    const panner = audioCtx.createStereoPanner();
+    let panX = targetX !== null ? targetX : gameState.player.x;
+    panner.pan.value = (panX - 300) / 300;
+
+    noise.connect(filter);
+    filter.connect(gain);
+    gain.connect(panner);
+    panner.connect(masterGain);
+
+    noise.start(t);
+}
+
+function startBallAmbience() {
+    if (ballLoopOsc || !buffers.ballLoop) return;
+
+    ballLoopOsc = audioCtx.createBufferSource();
+    ballLoopOsc.buffer = buffers.ballLoop;
+    ballLoopOsc.loop = true;
+
+    ballFilter = audioCtx.createBiquadFilter();
+    ballFilter.type = 'lowpass';
+    ballFilter.frequency.value = 400;
+
+    ballLoopGain = audioCtx.createGain();
+    ballPanner = audioCtx.createStereoPanner();
+
+    ballLoopOsc.connect(ballFilter);
+    ballFilter.connect(ballLoopGain);
+    ballLoopGain.connect(ballPanner);
+    ballPanner.connect(masterGain);
+
+    ballLoopOsc.start();
+
+    alignmentOsc = audioCtx.createOscillator();
+    alignmentOsc.type = 'sine';
+    alignmentOsc.frequency.value = 440;
+
+    alignmentGain = audioCtx.createGain();
+    alignmentGain.gain.value = 0;
+
+    alignmentOsc.connect(alignmentGain);
+    alignmentGain.connect(masterGain);
+    alignmentOsc.start();
+}
+
+function stopBallAmbience() {
+    if (ballLoopOsc) {
+        try {
+            ballLoopOsc.stop();
+            ballLoopOsc.disconnect();
+        } catch (e) { }
+        ballLoopOsc = null;
+    }
+    if (alignmentOsc) {
+        try {
+            alignmentOsc.stop();
+            alignmentOsc.disconnect();
+        } catch (e) { }
+        alignmentOsc = null;
+    }
+}
+
+function updateAudioPhysics() {
+    if (!ballLoopOsc) return;
+
+    let pan = (gameState.ball.x - 300) / 300;
+    ballPanner.pan.setTargetAtTime(Math.max(-1, Math.min(1, pan)), audioCtx.currentTime, 0.05);
+
+    let distFactor = Math.max(0, Math.min(1, gameState.ball.z / 450));
+    let proximity = 1.0 - distFactor;
+    let power = gameState.difficulty === 'easy' ? 1.5 : 2;
+    let vol = Math.pow(proximity, power);
+
+    if (gameState.difficulty === 'easy') {
+        vol = Math.min(vol * 1.5, 1.0);
+    }
+
+    vol = Math.max(0.1, vol);
+    ballLoopGain.gain.setTargetAtTime(vol, audioCtx.currentTime, 0.05);
+
+    let isComing = gameState.ball.vz < 0;
+
+    if (isComing) {
+        let filterFreq = 400 + ((1 - distFactor) * 600);
+        ballFilter.frequency.setTargetAtTime(filterFreq, audioCtx.currentTime, 0.05);
+        let rate = 1.0 + ((1 - distFactor) * 0.5);
+        if (ballLoopOsc.playbackRate) ballLoopOsc.playbackRate.setTargetAtTime(rate, audioCtx.currentTime, 0.05);
+    } else {
+        let filterFreq = 400 - (distFactor * 200);
+        ballFilter.frequency.setTargetAtTime(Math.max(100, filterFreq), audioCtx.currentTime, 0.1);
+        let rate = 1.0 - (distFactor * 0.2);
+        if (ballLoopOsc.playbackRate) ballLoopOsc.playbackRate.setTargetAtTime(Math.max(0.5, rate), audioCtx.currentTime, 0.1);
+    }
+
+    if (alignmentOsc && alignmentGain) {
+        let diff = Math.abs(gameState.ball.x - gameState.player.x);
+        let lockThreshold = gameState.difficulty === 'easy' ? 60 : 40;
+
+        if (diff < lockThreshold && gameState.ball.z < 350 && isComing) {
+            let accuracy = 1 - (diff / lockThreshold);
+            let targetGain = Math.pow(accuracy, 2) * 0.15;
+            alignmentGain.gain.setTargetAtTime(targetGain, audioCtx.currentTime, 0.05);
+
+            let targetPitch = 440 + (accuracy * 220);
+            alignmentOsc.frequency.setTargetAtTime(targetPitch, audioCtx.currentTime, 0.05);
+        } else {
+            alignmentGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+        }
+    }
+}
+
+function setupOnlineListeners() {
+    const socket = gameState.socket;
+
+    socket.on('game_update', (data) => {
+        if (data.type === 'paddle') {
+            if (Math.abs(gameState.opponent.x - data.x) > 10) {
+                playStep(data.x);
+            }
+            gameState.opponent.x = data.x;
+        } else if (data.type === 'ball') {
+            if (gameState.role === 'client') {
+                gameState.ball.x = data.x;
+                gameState.ball.z = 400 - data.z;
+                gameState.ball.vx = data.vx;
+                gameState.ball.vz = -data.vz;
+
+                if (Math.abs(data.vx) < 0.1 && Math.abs(data.vz) < 0.1) {
+                    // Ball is stationary, don't reset serving
+                } else {
+                    gameState.serving = false;
+                }
+            }
+        } else if (data.type === 'score') {
+            gameState.scores = data.scores;
+            gameState.setsWon = data.setsWon;
+            gameState.currentServer = data.currentServer;
+            updateScoreUI();
+
+            if (gameState.role === 'client') {
+                let announcement = "";
+                // Client is 'opponent' from host view, so swap everything
+                // If currentServer is 'player', it means HOST won, so client LOST
+                if (gameState.currentServer === 'opponent') {
+                    playSound('applause');
+                    announcement = `Sayı sizde. ${gameState.myName} ${gameState.scores.opponent}, ${gameState.opponentName} ${gameState.scores.player}`;
+                } else {
+                    playSound('OponentPoint');
+                    announcement = `Sayı rakipte. ${gameState.myName} ${gameState.scores.opponent}, ${gameState.opponentName} ${gameState.scores.player}`;
+                }
+                speak(announcement, true);
+            }
+        } else if (data.type === 'serve_action') {
+            if (gameState.role === 'host' && gameState.serving && gameState.currentServer === 'opponent') {
+                gameState.serving = false;
+                playSound('paddle', 0, 1.0, 1.1);
+                let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+                gameState.ball.vz = -diffParams.speed;
+                gameState.ball.vx = (Math.random() - 0.5) * 2;
+
+                socket.emit('game_update', {
+                    gameId: gameState.gameId,
+                    type: 'ball',
+                    x: gameState.ball.x,
+                    z: gameState.ball.z,
+                    vx: gameState.ball.vx,
+                    vz: gameState.ball.vz
+                });
+            }
+        } else if (data.type === 'serve') {
+            gameState.serving = true;
+            gameState.currentServer = data.currentServer;
+
+            // Start ball ambience for client
+            startBallAmbience();
+
+            if (gameState.currentServer === 'player') {
+                gameState.ball.x = gameState.player.x;
+                gameState.ball.z = 20;
+                speak("Servis sizde. Başlamak için yukarı ok tuşuna basın.", false);
+            } else {
+                gameState.ball.x = gameState.opponent.x;
+                gameState.ball.z = 380;
+                speak("Servis rakipte.", false);
+            }
+        } else if (data.type === 'hit') {
+            playSound('paddle', (gameState.ball.x - 300) / 300);
+        } else if (data.type === 'client_hit') {
+            // Host receives client hit notification
+            if (gameState.role === 'host') {
+                let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+
+                // Set ball position near client (far from host)
+                gameState.ball.z = 350;
+
+                // Set velocity towards host (negative z)
+                // Ensure speed increases but direction is strictly negative
+                let newSpeed = Math.abs(gameState.ball.vz) + diffParams.accel;
+                if (newSpeed > 15) newSpeed = 15;
+                gameState.ball.vz = -newSpeed;
+
+                let hitOffset = (gameState.ball.x - data.paddleX) / (PADDLE_W / 2);
+                gameState.ball.vx = hitOffset * 4;
+
+                playSound('paddle', (gameState.ball.x - 300) / 300);
+            }
+        }
+    });
+
+    socket.on('game_over', (data) => {
+        const clientWinner = data.winner === 'player' ? 'opponent' : 'player';
+        endGame(clientWinner);
+    });
+}
+
+function startGameLoop() {
+    console.log("Starting game loop...");
+    gameState.active = true;
+    document.getElementById('ball').style.display = 'block';
+
+    if (gameState.mode === 'online' && gameState.role === 'host') {
+        resetBall();
+    } else if (gameState.mode === 'computer') {
+        resetBall();
+    } else if (gameState.mode === 'online' && gameState.role === 'client') {
+        // Client waits for host
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+function update() {
+    if (!gameState.active || gameState.paused) return;
+
+    if (gameState.serving) {
+        if (gameState.currentServer === 'player') {
+            gameState.ball.x = gameState.player.x;
+            gameState.ball.z = 20;
+        } else {
+            gameState.ball.x = gameState.opponent.x;
+            gameState.ball.z = 380;
+        }
+        updateAudioPhysics();
+        return;
+    }
+
+    if (gameState.mode === 'online') {
+        if (gameState.lastSentX !== gameState.player.x) {
+            gameState.socket.emit('game_update', {
+                gameId: gameState.gameId,
+                type: 'paddle',
+                x: gameState.player.x
+            });
+            gameState.lastSentX = gameState.player.x;
+        }
+
+        if (gameState.role === 'host') {
+            updatePhysics();
+            gameState.socket.emit('game_update', {
+                gameId: gameState.gameId,
+                type: 'ball',
+                x: gameState.ball.x,
+                z: gameState.ball.z,
+                vx: gameState.ball.vx,
+                vz: gameState.ball.vz
+            });
+        } else {
+            // Client: check for paddle collision on client side
+            if (gameState.ball.z < 30 && gameState.ball.z > 0 && gameState.ball.vz < 0) {
+                if (Math.abs(gameState.ball.x - gameState.player.x) < PADDLE_W / 2) {
+                    // Client hit the ball! Send once per approach
+                    if (!gameState.clientHitSent) {
+                        gameState.clientHitSent = true;
+                        playSound('paddle', (gameState.ball.x - 300) / 300);
+
+                        // Emit hit to host
+                        gameState.socket.emit('game_update', {
+                            gameId: gameState.gameId,
+                            type: 'client_hit',
+                            paddleX: gameState.player.x
+                        });
+                    }
+                }
+            } else if (gameState.ball.z > 100) {
+                // Reset flag when ball is far away
+                gameState.clientHitSent = false;
+            }
+
+            // Update audio based on received ball position
+            updateAudioPhysics();
+        }
+    } else {
+        updatePhysics();
+
+        // AI opponent only in computer mode
+        if (gameState.mode === 'computer' && gameState.ball.z > 200 && gameState.ball.vz > 0) {
+            let diff = gameState.ball.x - gameState.opponent.x;
+            if (Math.abs(diff) > 5) {
+                gameState.opponent.x += Math.sign(diff) * 3;
+            }
+
+            if (gameState.ball.z > 380 && Math.abs(gameState.ball.x - gameState.opponent.x) < PADDLE_W / 2) {
+                gameState.ball.vz = -Math.abs(gameState.ball.vz);
+                let hitOffset = (gameState.ball.x - gameState.opponent.x) / (PADDLE_W / 2);
+                gameState.ball.vx += hitOffset * 2;
+                playSound('paddle', (gameState.ball.x - 300) / 300);
+            }
+        }
+    }
+
+    updateAudioPhysics();
+}
+
+function updatePhysics() {
+    gameState.ball.x += gameState.ball.vx;
+    gameState.ball.z += gameState.ball.vz;
+
+    // Wall collision
+    if (gameState.ball.x <= 0 || gameState.ball.x >= TABLE_W) {
+        gameState.ball.vx *= -1;
+        playSound('wall', (gameState.ball.x - 300) / 300);
+    }
+
+    // Paddle collision detection
+    // Online mode: host checks when ball is coming (vz > 0)
+    // Offline mode: player checks when ball is going away (vz < 0)
+    const isOnlineHost = gameState.mode === 'online' && gameState.role === 'host';
+    const velocityCheck = isOnlineHost ? (gameState.ball.vz > 0) : (gameState.ball.vz < 0);
+
+    if (gameState.ball.z < 30 && gameState.ball.z > 0 && velocityCheck) {
+        if (Math.abs(gameState.ball.x - gameState.player.x) < PADDLE_W / 2) {
+            let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+
+            // Hit back: reverse velocity
+            // If online host, ball goes to negative z (towards client) -> vz should be negative
+            // If offline, ball goes to positive z (towards opponent) -> vz should be positive
+            // Wait, standard physics:
+            // Host is at z=20. Opponent/Client is at z=380.
+            // Ball comes to Host: vz < 0. Host hits: vz > 0.
+
+            // BUT in our online fix, we said ball comes to Host with vz < 0 (standard)
+            // Let's re-verify the coordinate system.
+            // Player is always at z=20. Opponent is at z=380.
+            // Ball moves from Opponent to Player: vz decreases (negative).
+            // Ball moves from Player to Opponent: vz increases (positive).
+
+            // So, standard collision check is vz < 0 (ball coming to player).
+            // Host is Player. So Host should check vz < 0.
+
+            // Why did we change it to vz > 0?
+            // Because in the previous "fix", we set client hit to send ball with NEGATIVE velocity (towards host).
+            // If ball moves towards host, vz is NEGATIVE.
+            // So velocityCheck should be vz < 0.
+
+            // Let's revert to standard check: vz < 0.
+
+            gameState.ball.vz = Math.abs(gameState.ball.vz) + diffParams.accel;
+            if (gameState.ball.vz > 15) gameState.ball.vz = 15;
+
+            let hitOffset = (gameState.ball.x - gameState.player.x) / (PADDLE_W / 2);
+            gameState.ball.vx = hitOffset * 4;
+
+            playSound('paddle', (gameState.ball.x - 300) / 300);
+
+            if (gameState.mode === 'online' && gameState.role === 'host') {
+                gameState.socket.emit('game_update', {
+                    gameId: gameState.gameId,
+                    type: 'hit'
+                });
+            }
+        }
+    }
+
+    if (gameState.ball.z < -50) {
+        handleScore('opponent');
+    } else if (gameState.ball.z > 450) {
+        handleScore('player');
+    }
+}
+
+function handleScore(winner) {
+    if (gameState.mode === 'online' && gameState.role !== 'host') return;
+
+    stopBallAmbience();
+
+    let announcement = "";
+    if (winner === 'player') {
+        gameState.scores.player++;
+        announcement = `Sayı sizde. ${gameState.myName} ${gameState.scores.player}, ${gameState.opponentName} ${gameState.scores.opponent}`;
+        playSound('applause');
+        gameState.currentServer = 'player';
+    } else {
+        gameState.scores.opponent++;
+        announcement = `Sayı rakipte. ${gameState.myName} ${gameState.scores.player}, ${gameState.opponentName} ${gameState.scores.opponent}`;
+        playSound('OponentPoint');
+        gameState.currentServer = 'opponent';
+    }
+
+    speak(announcement, true);
+
+    checkSetWinner();
+    updateScoreUI();
+
+    if (gameState.mode === 'online') {
+        gameState.socket.emit('game_update', {
+            gameId: gameState.gameId,
+            type: 'score',
+            scores: gameState.scores,
+            setsWon: gameState.setsWon,
+            currentServer: gameState.currentServer
+        });
+    }
+}
+
+function checkSetWinner() {
+    const WIN_SCORE = 11;
+    if (gameState.scores.player >= WIN_SCORE && gameState.scores.player - gameState.scores.opponent >= 2) {
+        winSet('player');
+    } else if (gameState.scores.opponent >= WIN_SCORE && gameState.scores.opponent - gameState.scores.player >= 2) {
+        winSet('opponent');
+    } else {
+        resetBall();
+    }
+}
+
+function winSet(winner) {
+    if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+    }
+
+    const setScorePlayer = gameState.scores.player;
+    const setScoreOpponent = gameState.scores.opponent;
+
+    if (winner === 'player') {
+        gameState.setsWon.player++;
+        playSound('applause');
+    } else {
+        gameState.setsWon.opponent++;
+        playSound('GameOverLost');
+    }
+
+    gameState.scores.player = 0;
+    gameState.scores.opponent = 0;
+
+    const setsNeeded = Math.ceil(gameState.sets / 2);
+
+    const setScoreAnnouncement = `Set skoru: ${gameState.myName} ${setScorePlayer}, ${gameState.opponentName} ${setScoreOpponent}.`;
+    speak(setScoreAnnouncement, true);
+
+    setTimeout(() => {
+        const matchScoreAnnouncement = `Setlerde ${gameState.myName} ${gameState.setsWon.player}, ${gameState.opponentName} ${gameState.setsWon.opponent}.`;
+        speak(matchScoreAnnouncement, false);
+
+        setTimeout(() => {
+            if (gameState.setsWon.player >= setsNeeded) {
+                endGame('player');
+            } else if (gameState.setsWon.opponent >= setsNeeded) {
+                endGame('opponent');
+            } else {
+                resetBall();
+            }
+        }, 2500);
+    }, 2000);
+}
+
+function endGame(winner) {
+    if (!gameState.active) return;
+
+    gameState.active = false;
+    stopBallAmbience();
+
+    if (masterGain) {
+        masterGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    }
+
+    if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+    }
+
+    const finalScoreAnnouncement = `Maç skoru: Setlerde ${gameState.myName} ${gameState.setsWon.player}, ${gameState.opponentName} ${gameState.setsWon.opponent}.`;
+    const utter1 = new SpeechSynthesisUtterance(finalScoreAnnouncement);
+    utter1.lang = 'tr-TR';
+
+    utter1.onend = () => {
+        const msg = winner === 'player' ? "Tebrikler, maçı kazandınız!" : "Üzgünüm, maçı kaybettiniz.";
+        const utter2 = new SpeechSynthesisUtterance(msg + " Tekrar oynamak için Enter, menüye dönmek için Escape basın.");
+        utter2.lang = 'tr-TR';
+
+        utter2.onend = () => {
+            showGameOverModal(msg);
+        };
+
+        window.speechSynthesis.speak(utter2);
+    };
+
+    window.speechSynthesis.speak(utter1);
+
+    if (gameState.mode === 'online') {
+        gameState.socket.emit('game_over', { gameId: gameState.gameId, winner: winner });
+    }
+}
+
+function showGameOverModal(msg) {
+    const modal = document.createElement('div');
+    modal.id = 'game-over-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:3000;color:white;text-align:center;';
+    modal.innerHTML = `
+        <h2>Oyun Bitti</h2>
+        <p style="font-size:1.5rem;margin:20px;">${msg}</p>
+        <div>
+            <button id="btn-play-again" style="padding:15px 30px;font-size:1.2rem;margin-right:20px;">Tekrar Oyna (Enter)</button>
+            <button id="btn-main-menu" style="padding:15px 30px;font-size:1.2rem;">Ana Menü (Esc)</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const btnAgain = document.getElementById('btn-play-again');
+    const btnMenu = document.getElementById('btn-main-menu');
+
+    btnAgain.focus();
+
+    btnAgain.addEventListener('focus', () => speak("Tekrar Oyna düğmesi."));
+    btnMenu.addEventListener('focus', () => speak("Ana Menü düğmesi."));
+
+    const handleKey = (e) => {
+        e.stopPropagation();
+        if (e.code === 'Enter') {
+            if (document.activeElement === btnMenu) {
+                location.reload();
+            } else {
+                window.removeEventListener('keydown', handleKey, true);
+                modal.remove();
+                restartGame();
+            }
+        } else if (e.code === 'Escape') {
+            location.reload();
+        }
+    };
+
+    window.addEventListener('keydown', handleKey, true);
+
+    btnAgain.onclick = () => {
+        window.removeEventListener('keydown', handleKey, true);
+        modal.remove();
+        restartGame();
+    };
+
+    btnMenu.onclick = () => {
+        location.reload();
+    };
+}
+
+function restartGame() {
+    gameState.scores = { player: 0, opponent: 0 };
+    gameState.setsWon = { player: 0, opponent: 0 };
+    gameState.active = true;
+    gameState.paused = false;
+
+    // Re-enable audio after game end
+    if (masterGain) {
+        masterGain.gain.setValueAtTime(0.8, audioCtx.currentTime);
+    }
+
+    updateScoreUI();
+
+    if (gameState.mode === 'online') {
+        gameState.socket.emit('rematch_request', {
+            gameId: gameState.gameId
+        });
+        speak("Revanche isteği gönderildi. Rakibinizin cevabı bekleniyor.");
+    } else {
+        speak("Yeni oyun başlıyor. Servis sizde.", true);
+        gameState.currentServer = 'player';
+        resetBall();
+        requestAnimationFrame(gameLoop);
+    }
+}
+
+function resetBall() {
+    gameState.ball.x = 300;
+    gameState.ball.z = 200;
+    gameState.ball.vx = 0;
+    gameState.ball.vz = 0;
+
+    gameState.serving = true;
+    startBallAmbience();
+
+    if (gameState.mode !== 'online') {
+        if (gameState.currentServer === 'player') {
+            gameState.ball.x = gameState.player.x;
+            gameState.ball.z = 20;
+            speak("Servis sizde. Başlamak için yukarı ok tuşuna basın.", false);
+        } else {
+            gameState.ball.x = gameState.opponent.x;
+            gameState.ball.z = 380;
+            speak("Servis rakipte.", false);
+
+            if (gameState.mode === 'computer') {
+                setTimeout(() => {
+                    if (gameState.serving && gameState.active) {
+                        gameState.serving = false;
+                        playSound('paddle', (gameState.ball.x - 300) / 300, 1.0, 0.9);
+                        let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+                        gameState.ball.vz = -diffParams.speed;
+                        gameState.ball.vx = (Math.random() - 0.5) * 2;
+                    }
+                }, 2000);
+            }
+        }
+    }
+
+    if (gameState.mode === 'online') {
+        if (gameState.role === 'host') {
+            gameState.socket.emit('game_update', {
+                gameId: gameState.gameId,
+                type: 'serve',
+                currentServer: gameState.currentServer
+            });
+        }
+    }
+}
+
+function showExitConfirmation() {
+    const modal = document.createElement('div');
+    modal.id = 'exit-modal';
+    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:3000;color:white;text-align:center;';
+    modal.innerHTML = `
+        <h2>Oyundan Çık?</h2>
+        <p>Oyunu sonlandırmak istediğinize emin misiniz?</p>
+        <div style="margin-top:20px;">
+            <button id="btn-exit-yes" style="padding:10px 20px;margin-right:10px;">Evet (Enter)</button>
+            <button id="btn-exit-no" style="padding:10px 20px;">Hayır (Esc)</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const btnYes = document.getElementById('btn-exit-yes');
+    const btnNo = document.getElementById('btn-exit-no');
+
+    btnYes.focus();
+
+    const handleKey = (e) => {
+        e.stopPropagation();
+        if (e.code === 'Enter') {
+            cleanup();
+            location.reload();
+        } else if (e.code === 'Escape') {
+            cleanup();
+            modal.remove();
+            gameState.paused = false;
+            speak("Oyun devam ediyor.", true);
+        }
+    };
+
+    const cleanup = () => {
+        window.removeEventListener('keydown', handleKey, true);
+    };
+
+    window.addEventListener('keydown', handleKey, true);
+
+    btnYes.onclick = () => { cleanup(); location.reload(); };
+    btnNo.onclick = () => {
+        cleanup();
+        modal.remove();
+        gameState.paused = false;
+        speak("Oyun devam ediyor.", true);
+    };
+}
+
+function draw() {
+    const b = document.getElementById('ball');
+    const p = document.getElementById('player-paddle');
+    const o = document.getElementById('opponent-paddle');
+
+    if (b) {
+        b.style.left = gameState.ball.x + 'px';
+        let visY = (gameState.ball.z / 400) * 380;
+        b.style.bottom = (visY + 10) + 'px';
+    }
+
+    if (p) p.style.left = gameState.player.x + 'px';
+    if (o) o.style.left = gameState.opponent.x + 'px';
+}
+
+function gameLoop() {
+    if (!gameState.active) return;
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+function speak(text, interrupt = true) {
+    if (window.speechSynthesis) {
+        if (interrupt) {
+            window.speechSynthesis.cancel();
+        }
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = 'tr-TR';
+        window.speechSynthesis.speak(utter);
+    }
+}
+
+function updateScoreUI() {
+    const pScore = document.getElementById('score-player');
+    const oScore = document.getElementById('score-opponent');
+    if (pScore) pScore.innerText = `${gameState.scores.player} (Set: ${gameState.setsWon.player})`;
+    if (oScore) oScore.innerText = `${gameState.scores.opponent} (Set: ${gameState.setsWon.opponent})`;
+}
+
+window.addEventListener('keydown', (e) => {
+    if (!gameState.active) return;
+
+    if (e.code === 'ArrowLeft') {
+        gameState.player.x -= 15;
+        if (gameState.player.x < PADDLE_W / 2) gameState.player.x = PADDLE_W / 2;
+        playStep();
+    }
+    if (e.code === 'ArrowRight') {
+        gameState.player.x += 15;
+        if (gameState.player.x > TABLE_W - PADDLE_W / 2) gameState.player.x = TABLE_W - PADDLE_W / 2;
+        playStep();
+    }
+
+    if (e.code === 'ArrowUp') {
+        if (gameState.serving && gameState.currentServer === 'player') {
+            if (gameState.mode === 'online') {
+                if (gameState.role === 'host') {
+                    gameState.serving = false;
+                    playSound('paddle', 0, 1.0, 1.1);
+                    let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+                    gameState.ball.vz = diffParams.speed;
+                    gameState.ball.vx = (Math.random() - 0.5) * 2;
+
+                    gameState.socket.emit('game_update', {
+                        gameId: gameState.gameId,
+                        type: 'ball',
+                        x: gameState.ball.x,
+                        z: gameState.ball.z,
+                        vx: gameState.ball.vx,
+                        vz: gameState.ball.vz
+                    });
+                } else {
+                    gameState.socket.emit('game_update', {
+                        gameId: gameState.gameId,
+                        type: 'serve_action'
+                    });
+                }
+            } else {
+                gameState.serving = false;
+                playSound('paddle', 0, 1.0, 1.1);
+                let diffParams = DIFFICULTIES[gameState.difficulty] || DIFFICULTIES.medium;
+                gameState.ball.vz = diffParams.speed;
+                gameState.ball.vx = (Math.random() - 0.5) * 2;
+            }
+        }
+    }
+
+    if (e.code === 'KeyP') {
+        gameState.paused = !gameState.paused;
+        speak(gameState.paused ? "Oyun duraklatıldı" : "Oyun devam ediyor", true);
+    }
+
+    if (e.code === 'Escape') {
+        gameState.paused = true;
+        showExitConfirmation();
+    }
+});
+
+function showStartOverlay(msg, callback) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);display:flex;flex-direction:column;justify-content:center;align-items:center;z-index:2000;color:white;text-align:center;padding:20px;';
+    overlay.innerHTML = `<h1>UYARI</h1><p id="start-msg">${msg}</p><button id="btn-start-game" style="padding:15px 30px;font-size:1.2rem;margin-top:20px;">TAMAM (Başla)</button>`;
+    document.body.appendChild(overlay);
+
+    const btn = document.getElementById('btn-start-game');
+    const msgText = document.getElementById('start-msg').textContent;
+
+    speak("Uyarı. " + msgText + " Başlamak için Tamam düğmesine basın.", true);
+
+    btn.focus();
+    btn.onclick = () => {
+        if (audioCtx && audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+        overlay.remove();
+        callback();
+    };
+
+    btn.addEventListener('focus', () => speak("Tamam düğmesi. Oyunu başlatır."));
+}
+
+window.initGame = async function (mode, diff, setNum, onlineData = null, myName = 'Ben', opponentName = 'Rakip') {
+    gameState.mode = mode;
+    gameState.difficulty = diff;
+    gameState.sets = setNum;
+    gameState.myName = myName;
+    gameState.opponentName = opponentName;
+
+    if (mode === 'online' && onlineData) {
+        gameState.socket = onlineData.socket;
+        gameState.gameId = onlineData.gameId;
+        gameState.role = onlineData.role;
+        setupOnlineListeners();
+    }
+
+    await initAudioSystem();
+
+    showStartOverlay("Lütfen dikkat: Oyun sırasında ekran okuyucunuzu kapatmanız gerekmektedir. Tamam diyerek oyuna başlayın.", () => {
+        speak("Oyun başlıyor. " + (gameState.role === 'client' ? "Servis rakipte." : "Servis sizde."));
+        startGameLoop();
+    });
+};
